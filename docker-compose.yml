@@ -1,3 +1,8 @@
+# Pulls in the observability stack (Prometheus, Grafana, Loki, Alloy,
+# Node Exporter, cAdvisor). Paths inside it resolve relative to monitoring/.
+include:
+  - monitoring/docker-compose.yaml
+
 services:
   app:
     build:
