@@ -11,11 +11,6 @@ output "app_url" {
   value = "http://${aws_instance.app.public_dns}"
 }
 
-output "ecr_repository_url" {
-  description = "ECR repository (GitHub variable ECR_REPOSITORY)."
-  value       = aws_ecr_repository.app.repository_url
-}
-
 output "github_actions_role_arn" {
   description = "Role assumed by GitHub Actions via OIDC (GitHub variable AWS_ROLE_ARN)."
   value       = aws_iam_role.github_deploy.arn

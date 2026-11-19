@@ -9,6 +9,9 @@
 #   deploy-app.sh --current        print the currently deployed tag
 #
 # Configuration comes from /etc/devops-task/deploy.env (written by user data).
+# Images are pulled from IMAGE_REPOSITORY (GHCR). A public package needs no
+# credentials; for a private one, set REGISTRY_USERNAME and REGISTRY_TOKEN (a
+# read:packages token) in the config file.
 # Exit codes: 0 deployed, 1 deploy failed but rollback succeeded, 2 deploy and rollback failed, 3 usage error
 
 set -euo pipefail
@@ -21,7 +24,7 @@ readonly CONTAINER=app
 
 # shellcheck source=/dev/null
 [[ -r "$CONFIG" ]] && . "$CONFIG"
-: "${ECR_REPOSITORY_URL:?ECR_REPOSITORY_URL is not set in $CONFIG}"
+: "${IMAGE_REPOSITORY:?IMAGE_REPOSITORY is not set in $CONFIG}"
 : "${AWS_REGION:?AWS_REGION is not set in $CONFIG}"
 : "${LOG_GROUP:?LOG_GROUP is not set in $CONFIG}"
 : "${APP_ENVIRONMENT:=staging}"
@@ -32,8 +35,10 @@ readonly CONTAINER=app
 log() { printf '%s deploy-app: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 registry_login() {
-  aws ecr get-login-password --region "$AWS_REGION" \
-    | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URL%%/*}" >/dev/null
+  # Public packages are pulled anonymously.
+  [[ -n "${REGISTRY_USERNAME:-}" && -n "${REGISTRY_TOKEN:-}" ]] || return 0
+  printf '%s' "$REGISTRY_TOKEN" \
+    | docker login --username "$REGISTRY_USERNAME" --password-stdin "${IMAGE_REPOSITORY%%/*}" >/dev/null
 }
 
 run_container() {
@@ -54,7 +59,7 @@ run_container() {
     --log-opt awslogs-region="$AWS_REGION" \
     --log-opt awslogs-group="$LOG_GROUP" \
     --log-opt awslogs-stream="app-$(hostname)" \
-    "${ECR_REPOSITORY_URL}:${tag}" >/dev/null
+    "${IMAGE_REPOSITORY}:${tag}" >/dev/null
 }
 
 healthy() {
@@ -72,9 +77,9 @@ deploy() {
   local tag="$1" previous=""
   [[ -r "$CURRENT_FILE" ]] && previous="$(<"$CURRENT_FILE")"
 
-  log "deploying ${ECR_REPOSITORY_URL}:${tag} (previous: ${previous:-none})"
+  log "deploying ${IMAGE_REPOSITORY}:${tag} (previous: ${previous:-none})"
   registry_login
-  if ! docker pull -q "${ECR_REPOSITORY_URL}:${tag}" >/dev/null; then
+  if ! docker pull -q "${IMAGE_REPOSITORY}:${tag}" >/dev/null; then
     log "ERROR: cannot pull tag ${tag}; leaving the running container untouched"
     return 2
   fi
@@ -129,7 +134,7 @@ rollback() {
 case "${1:-}" in
   --rollback) rollback ;;
   --current) cat "$CURRENT_FILE" 2>/dev/null || echo "none" ;;
-  "" | -h | --help) sed -n '3,13p' "$0"; [[ -n "${1:-}" ]] || exit 3 ;;
+  "" | -h | --help) sed -n '3,15p' "$0"; [[ -n "${1:-}" ]] || exit 3 ;;
   -*) echo "unknown option: $1" >&2; exit 3 ;;
   *)
     [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid image tag: $1" >&2; exit 3; }

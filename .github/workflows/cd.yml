@@ -1,7 +1,7 @@
 name: CD
 
-# push to main      -> build, push and deploy to the "staging" environment
-# push a vX.Y.Z tag -> build, push and deploy to "production" (protect this
+# push to main      -> build and push to GHCR, deploy to the "staging" environment
+# push a vX.Y.Z tag -> build and push to GHCR, deploy to "production" (protect this
 #                      GitHub Environment with required reviewers)
 on:
   push:
@@ -15,6 +15,9 @@ permissions:
 concurrency:
   group: cd-${{ startsWith(github.ref, 'refs/tags/') && 'production' || 'staging' }}
   cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   ci:
@@ -46,36 +49,31 @@ jobs:
             echo "version=$version"
             echo "sha_tag=sha-${GITHUB_SHA::7}"
           } >> "$GITHUB_OUTPUT"
-          echo "Deploying **$version** (sha-${GITHUB_SHA::7}) to **$environment**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release **$version** (sha-${GITHUB_SHA::7}) for **$environment**" >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: Build and push multi-arch image
+    name: Build and push multi-arch image (GHCR)
     runs-on: ubuntu-24.04
     needs: [ci, meta]
-    # Skipped until the GitHub Environment is configured (see README "Required configuration"),
-    # so merges before AWS exists don't produce failing runs.
-    if: vars.AWS_ROLE_ARN != ''
-    environment: ${{ needs.meta.outputs.environment }}
     permissions:
       contents: read
-      id-token: write   # GitHub OIDC -> AWS, no long-lived keys
+      packages: write   # push to ghcr.io with the workflow's GITHUB_TOKEN; no stored credentials
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: docker/login-action@v3
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ vars.ECR_REPOSITORY }}
-          flavor: latest=false   # ECR tags are immutable; never rely on "latest"
+          images: ${{ env.IMAGE }}
+          flavor: latest=false   # deploys use the commit tag; never rely on "latest"
           tags: |
             type=raw,value=${{ needs.meta.outputs.sha_tag }}
             type=raw,value=${{ needs.meta.outputs.version }}
@@ -97,18 +95,26 @@ jobs:
             REVISION=${{ github.sha }}
             CREATED=${{ github.event.head_commit.timestamp }}
             SOURCE=${{ github.server_url }}/${{ github.repository }}
-      - run: echo "Pushed ${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+      - run: |
+          {
+            echo "Pushed \`${IMAGE}@${{ steps.push.outputs.digest }}\`"
+            echo
+            echo "Tags: \`${{ needs.meta.outputs.sha_tag }}\`, \`${{ needs.meta.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: Deploy to EC2 (SSM) with smoke test and rollback
     runs-on: ubuntu-24.04
     needs: [meta, build]
+    # Skipped until the GitHub Environment has the AWS variables (see README
+    # "Required configuration"); building and pushing the image does not need AWS.
+    if: vars.AWS_ROLE_ARN != ''
     environment:
       name: ${{ needs.meta.outputs.environment }}
       url: ${{ steps.smoke.outputs.url }}
     permissions:
       contents: read
-      id-token: write
+      id-token: write   # GitHub OIDC -> AWS, no long-lived keys
     env:
       INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
       TAG: ${{ needs.meta.outputs.sha_tag }}
