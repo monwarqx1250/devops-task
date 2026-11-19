@@ -1,0 +1,158 @@
+name: CD
+
+# push to main      -> build, push and deploy to the "staging" environment
+# push a vX.Y.Z tag -> build, push and deploy to "production" (protect this
+#                      GitHub Environment with required reviewers)
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+# Never run two deploys to the same environment at once; never cancel one midway.
+concurrency:
+  group: cd-${{ startsWith(github.ref, 'refs/tags/') && 'production' || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
+  meta:
+    name: Resolve environment and version
+    runs-on: ubuntu-24.04
+    outputs:
+      environment: ${{ steps.v.outputs.environment }}
+      version: ${{ steps.v.outputs.version }}
+      sha_tag: ${{ steps.v.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          base="$(jq -r .version package.json)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            environment=production
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" == "$base" ]] || { echo "::error::tag v$version does not match package.json version $base"; exit 1; }
+          else
+            environment=staging
+            version="${base}-main.${GITHUB_RUN_NUMBER}"   # valid SemVer pre-release
+          fi
+          {
+            echo "environment=$environment"
+            echo "version=$version"
+            echo "sha_tag=sha-${GITHUB_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploying **$version** (sha-${GITHUB_SHA::7}) to **$environment**" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and push multi-arch image
+    runs-on: ubuntu-24.04
+    needs: [ci, meta]
+    # Skipped until the GitHub Environment is configured (see README "Required configuration"),
+    # so merges before AWS exists don't produce failing runs.
+    if: vars.AWS_ROLE_ARN != ''
+    environment: ${{ needs.meta.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write   # GitHub OIDC -> AWS, no long-lived keys
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ECR_REPOSITORY }}
+          flavor: latest=false   # ECR tags are immutable; never rely on "latest"
+          tags: |
+            type=raw,value=${{ needs.meta.outputs.sha_tag }}
+            type=raw,value=${{ needs.meta.outputs.version }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ needs.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ github.event.head_commit.timestamp }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+      - run: echo "Pushed ${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to EC2 (SSM) with smoke test and rollback
+    runs-on: ubuntu-24.04
+    needs: [meta, build]
+    environment:
+      name: ${{ needs.meta.outputs.environment }}
+      url: ${{ steps.smoke.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      TAG: ${{ needs.meta.outputs.sha_tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Record the currently deployed tag
+        run: |
+          previous="$(scripts/ci/ssm-run.sh "$INSTANCE_ID" /usr/local/bin/deploy-app.sh --current | tail -n1)"
+          echo "PREVIOUS_TAG=$previous" >> "$GITHUB_ENV"
+          echo "Previously deployed: \`$previous\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # deploy-app.sh health-checks the new container on the instance and restores
+      # the previous tag by itself if it never becomes healthy (exit 1 or 2).
+      - name: Deploy ${{ env.TAG }}
+        run: scripts/ci/ssm-run.sh "$INSTANCE_ID" /usr/local/bin/deploy-app.sh "$TAG"
+
+      - name: External smoke test
+        id: smoke
+        run: |
+          host="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicDnsName' --output text)"
+          url="http://${host}"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          for attempt in $(seq 1 10); do
+            if body="$(curl -fsS -m 5 "$url/health")" && [[ "$(curl -fsS -m 5 "$url/" | jq -r .version)" == "$VERSION" ]]; then
+              echo "smoke test passed on attempt $attempt: $body"
+              echo "Smoke test passed: $url/health -> $body (version $VERSION)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying in 6s"
+            sleep 6
+          done
+          echo "::error::smoke test failed for $url"
+          exit 1
+
+      - name: Roll back to the previous tag
+        if: failure() && env.PREVIOUS_TAG != '' && env.PREVIOUS_TAG != 'none'
+        run: |
+          echo "::warning::deploy of $TAG failed, rolling back to $PREVIOUS_TAG"
+          scripts/ci/ssm-run.sh "$INSTANCE_ID" /usr/local/bin/deploy-app.sh "$PREVIOUS_TAG"
+          echo "Rolled back to \`$PREVIOUS_TAG\`" >> "$GITHUB_STEP_SUMMARY"

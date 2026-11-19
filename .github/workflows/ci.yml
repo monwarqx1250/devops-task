@@ -1,0 +1,152 @@
+name: CI
+
+# Runs on every pull request, and is reused by the CD workflow as its gate.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: 1.3.8
+  TERRAFORM_VERSION: 1.12.2
+  TRIVY_IMAGE: aquasec/trivy:0.63.0
+  PROMETHEUS_IMAGE: prom/prometheus:v3.4.1
+  KUBECONFORM_VERSION: v0.6.7
+
+jobs:
+  app:
+    name: Lint, type-check, test (coverage)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies (from lockfile)
+        run: bun install --frozen-lockfile
+      - name: Lint (Biome)
+        run: bun run lint
+      - name: Type-check (tsc)
+        run: bun run typecheck
+      - name: Unit tests with coverage
+        run: |
+          bun run test:coverage 2>&1 | tee coverage.txt
+          {
+            echo '### Test coverage'
+            echo '```'
+            grep -E '^(-|File|All files| *[a-z]).*\|' coverage.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: coverage/lcov.info
+          if-no-files-found: warn
+
+  lint-infra:
+    name: Dockerfile, shell, workflow lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck scripts/*.sh scripts/ci/*.sh k8s/*.sh
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+  terraform:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - run: terraform fmt -check -recursive -diff terraform
+      - name: validate (environment stack)
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+      - name: validate (state bootstrap)
+        run: |
+          terraform -chdir=terraform/bootstrap init -backend=false -input=false
+          terraform -chdir=terraform/bootstrap validate
+
+  kubernetes:
+    name: Kubernetes manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeconform
+        run: |
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz kubeconform
+      - name: Render and validate against the Kubernetes schemas
+        run: |
+          cp k8s/secret.env.example k8s/secret.env   # placeholder values for rendering only
+          kubectl kustomize k8s > rendered.yaml
+          ./kubeconform -strict -summary -kubernetes-version 1.31.0 rendered.yaml
+
+  monitoring:
+    name: Prometheus rules and compose config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: promtool check + unit-test alert rules
+        run: |
+          docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /p/alerts.yml
+          docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" -w /p/tests --entrypoint promtool "$PROMETHEUS_IMAGE" test rules alerts_test.yml
+      - name: docker compose config
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+  image:
+    name: Build image and scan (Trivy)
+    runs-on: ubuntu-24.04
+    needs: [app, lint-infra]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: devops-task:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=0.0.0-ci
+            REVISION=${{ github.sha }}
+      - name: Report image size
+        run: |
+          docker image ls "devops-task:ci-${{ github.sha }}" --format 'Image size: {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Trivy image scan (fail on CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "devops-task:ci-${{ github.sha }}"
+      - name: Trivy report (HIGH, informational)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --severity HIGH --exit-code 0 --no-progress "devops-task:ci-${{ github.sha }}"
+      - name: Trivy misconfiguration scan (Dockerfile, Terraform, Kubernetes)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$TRIVY_IMAGE" config \
+            --severity HIGH,CRITICAL --exit-code 1 /src
