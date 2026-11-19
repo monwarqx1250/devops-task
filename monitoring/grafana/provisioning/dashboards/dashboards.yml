@@ -1,0 +1,14 @@
+# Load every dashboard JSON from the repository. Edits made in the UI are not
+# saved back; change the JSON files instead so dashboards stay in version control.
+apiVersion: 1
+
+providers:
+  - name: devops-task
+    folder: DevOps Task
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
