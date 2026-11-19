@@ -1,4 +1,20 @@
 services:
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: loki
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/loki.yml
+    # No published ports: Alloy and Grafana reach Loki at loki:3100 internally.
+    volumes:
+      - ./loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+
   prometheus:
     image: prom/prometheus:v3.4.1
     container_name: prometheus
@@ -68,5 +84,30 @@ services:
           cpus: "0.25"
           memory: 256M
 
+  # Log collector. Discovers containers via the Docker socket (read-only),
+  # tails their logs, parses the app's JSON logs and pushes everything to Loki.
+  alloy:
+    image: grafana/alloy:v1.9.1
+    container_name: alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+
 volumes:
   prometheus-data:
+  alloy-data:
+  loki-data:

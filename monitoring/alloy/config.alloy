@@ -1,0 +1,97 @@
+// Grafana Alloy: collect logs from every Docker container and ship them to Loki.
+//
+// Label policy (kept low-cardinality on purpose):
+//   container, service, project  -> one value per container, bounded
+//   level                        -> at most 6 values (trace..fatal)
+// High-cardinality fields from the app's JSON logs (path, method, status_code,
+// req_id) are stored as Loki structured metadata: they are filterable in
+// Grafana without creating a new stream per value.
+
+// ---------------------------------------------------------------------------
+// Discovery: find running containers through the Docker API.
+// ---------------------------------------------------------------------------
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  // "/loki" -> "loki"
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Collection: tail container stdout/stderr.
+// ---------------------------------------------------------------------------
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.containers.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Processing: parse the app's structured (pino/Fastify) JSON logs only.
+// Other containers pass through untouched.
+// ---------------------------------------------------------------------------
+loki.process "containers" {
+  stage.match {
+    selector = "{service=\"app\"}"
+
+    stage.json {
+      expressions = {
+        level       = "level",
+        method      = "req.method",
+        path        = "req.url",
+        status_code = "res.statusCode",
+        req_id      = "reqId",
+      }
+    }
+
+    // pino emits numeric levels by default; map them to names.
+    stage.template {
+      source   = "level"
+      template = "{{ if eq .Value \"10\" }}trace{{ else if eq .Value \"20\" }}debug{{ else if eq .Value \"30\" }}info{{ else if eq .Value \"40\" }}warn{{ else if eq .Value \"50\" }}error{{ else if eq .Value \"60\" }}fatal{{ else }}{{ .Value }}{{ end }}"
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+
+    stage.structured_metadata {
+      values = {
+        method      = "",
+        path        = "",
+        status_code = "",
+        req_id      = "",
+      }
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
