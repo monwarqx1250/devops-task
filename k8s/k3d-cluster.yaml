@@ -1,0 +1,14 @@
+# Local cluster for the Kubernetes step:
+#   k3d cluster create --config k8s/k3d-cluster.yaml
+# k3s ships Traefik (Ingress) and metrics-server (needed by the HPA).
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: devops-task
+servers: 1
+agents: 1
+image: rancher/k3s:v1.31.5-k3s1
+ports:
+  - port: 8081:80          # Ingress on http://devops-task.localhost:8081
+    nodeFilters:
+      - loadbalancer
