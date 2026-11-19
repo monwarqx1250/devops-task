@@ -1,0 +1,98 @@
+# Prometheus alerting rules. Thresholds and `for` durations are explained in
+# the README ("Alerting"). Validate with:
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p" --entrypoint promtool \
+#     prom/prometheus:v3.4.1 test rules /p/tests/alerts_test.yml
+groups:
+  - name: app
+    rules:
+      - alert: AppInstanceDown
+        # 4 failed scrapes in a row (15s interval). A normal container restart
+        # takes ~5s and does not fire; a crash loop or hung process does.
+        expr: up{job="app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "App instance {{ $labels.instance }} is down"
+          description: "Prometheus has failed to scrape {{ $labels.instance }} for more than 1 minute."
+
+      - alert: AppHighErrorRate
+        # More than 5% of requests returning 5xx over 5 minutes, sustained for
+        # 5 minutes. The traffic guard (> 0.1 req/s) stops a single failed
+        # request on an idle service from paging anyone.
+        expr: |
+          (
+            sum(rate(http_requests_total{job="app", status_code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="app"}[5m]))
+          ) > 0.05
+          and
+          sum(rate(http_requests_total{job="app"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "App 5xx error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of requests are failing with 5xx."
+
+      - alert: AppHighLatency
+        # p95 above 500 ms for 10 minutes. The service answers in a few ms
+        # normally; 500 ms is user-visible slowness. Longer `for` because
+        # latency is noisier than errors and is a warning, not an outage.
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{job="app", route!="/health"}[5m]))
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "App p95 latency above 500ms"
+          description: "p95 latency is {{ $value | humanizeDuration }}."
+
+  - name: host
+    rules:
+      - alert: HostDiskUsageHigh
+        # 80% leaves time to act before a full disk breaks Docker, Loki and
+        # Prometheus. Disk fills slowly, so 10m avoids alerts on transient
+        # spikes such as image pulls or log bursts.
+        expr: |
+          100 * (1 - node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|ramfs|squashfs|overlay|nsfs|fuse.*|virtiofs"}
+                   / node_filesystem_size_bytes{job="node-exporter", fstype!~"tmpfs|ramfs|squashfs|overlay|nsfs|fuse.*|virtiofs"}) > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk {{ $labels.device }} ({{ $labels.mountpoint }}) is above 80%"
+          description: "Filesystem usage is {{ $value | printf \"%.1f\" }}%."
+
+  - name: containers
+    rules:
+      - alert: ContainerMemoryNearLimit
+        # Working set above 90% of the limit for 5 minutes: the kernel OOM-kills
+        # at 100%, so this is the last useful warning. Containers without a
+        # limit are excluded (limit = 0).
+        expr: |
+          max by (name) (container_memory_working_set_bytes{name!=""})
+          /
+          max by (name) (container_spec_memory_limit_bytes{name!=""} > 0)
+          > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} is using more than 90% of its memory limit"
+          description: "Memory usage is {{ $value | humanizePercentage }} of the limit."
+
+  - name: monitoring
+    rules:
+      - alert: ScrapeTargetDown
+        # Any other exporter (node-exporter, cadvisor) unreachable: dashboards
+        # and the alerts above silently go blind without this.
+        expr: up{job!="app"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} ({{ $labels.job }})."

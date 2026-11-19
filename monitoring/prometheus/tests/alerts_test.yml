@@ -1,0 +1,92 @@
+rule_files:
+  - ../alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  - name: AppInstanceDown fires after 1 minute, not before
+    interval: 15s
+    input_series:
+      - series: 'up{job="app", instance="app:3000"}'
+        values: '1 1 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: AppInstanceDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AppInstanceDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: app, instance: "app:3000"}
+            exp_annotations:
+              summary: "App instance app:3000 is down"
+              description: "Prometheus has failed to scrape app:3000 for more than 1 minute."
+
+  - name: AppHighErrorRate fires at 10% errors, ignores idle traffic
+    interval: 1m
+    input_series:
+      # 10 req/s total, 1 req/s of them 5xx -> 10% error rate
+      - series: 'http_requests_total{job="app", route="/", status_code="200", method="GET"}'
+        values: '0+540x20'
+      - series: 'http_requests_total{job="app", route="/", status_code="500", method="GET"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AppHighErrorRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: AppHighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "App 5xx error rate above 5%"
+              description: "10% of requests are failing with 5xx."
+
+  - name: AppHighErrorRate stays quiet on a near-idle service
+    interval: 1m
+    input_series:
+      # 1 failing request per minute and nothing else: 100% errors, ~0.017 req/s
+      - series: 'http_requests_total{job="app", route="/", status_code="500", method="GET"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AppHighErrorRate
+        exp_alerts: []
+
+  - name: ContainerMemoryNearLimit ignores containers without a limit
+    interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{name="app"}'
+        values: '240x10'
+      - series: 'container_spec_memory_limit_bytes{name="app"}'
+        values: '256x10'
+      - series: 'container_memory_working_set_bytes{name="nolimit"}'
+        values: '999x10'
+      - series: 'container_spec_memory_limit_bytes{name="nolimit"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ContainerMemoryNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, name: app}
+            exp_annotations:
+              summary: "Container app is using more than 90% of its memory limit"
+              description: "Memory usage is 93.75% of the limit."
+
+  - name: HostDiskUsageHigh fires above 80% after 10 minutes
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", device="/dev/vda1", mountpoint="/", fstype="ext4"}'
+        values: '15x20'
+      - series: 'node_filesystem_size_bytes{job="node-exporter", device="/dev/vda1", mountpoint="/", fstype="ext4"}'
+        values: '100x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HostDiskUsageHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HostDiskUsageHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, job: node-exporter, device: /dev/vda1, mountpoint: /, fstype: ext4}
+            exp_annotations:
+              summary: "Disk /dev/vda1 (/) is above 80%"
+              description: "Filesystem usage is 85.0%."
