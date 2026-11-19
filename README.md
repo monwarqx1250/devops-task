@@ -33,8 +33,8 @@ A Bun/Fastify service taken from source code to a production-ready, observable a
 |---|---|
 | Application | Fastify service with `/`, `/health`, `/metrics`, JSON logs, graceful shutdown, unit tests |
 | Container | Multi-stage Dockerfile (Alpine, digest-pinned, non-root, health check, OCI labels), `docker-compose.yml` |
-| CI/CD | GitHub Actions: lint, type-check, tests + coverage, hadolint, shellcheck, Trivy; multi-arch build to ECR via OIDC; SSM deploy with smoke test and automatic rollback |
-| Infrastructure | Terraform for EC2 + IAM + ECR + CloudWatch Logs + GitHub OIDC, S3 remote state with locking, staging/production variables |
+| CI/CD | GitHub Actions: lint, type-check, tests + coverage, hadolint, shellcheck, Trivy; multi-arch build pushed to GitHub Container Registry; SSM deploy via OIDC with smoke test and automatic rollback |
+| Infrastructure | Terraform for EC2 + IAM + CloudWatch Logs + GitHub OIDC, S3 remote state with locking, staging/production variables |
 | Kubernetes | Kustomize manifests for k3d: Deployment, Service, Ingress, ConfigMap, Secret, HPA, PDB, restricted security context |
 | Observability | Prometheus, Grafana, Loki, Grafana Alloy, Node Exporter, cAdvisor; dashboards and data sources as code; 6 alert rules with unit tests |
 | Automation | `system_health.sh` with thresholds, JSON output, exit codes, log rotation, systemd timer and cron entry |
@@ -303,7 +303,7 @@ The screenshot above was taken during a spike produced by the fault-injection ro
 
 1. **CI gate**: the whole CI workflow runs again (`workflow_call`).
 2. **Resolve environment and version**: `main` → `staging`, version `<package.json version>-main.<run number>` (a SemVer pre-release); tag `vX.Y.Z` → `production`, version `X.Y.Z` (the tag must match `package.json`).
-3. **Build and push**: multi-arch (`linux/amd64`, `linux/arm64`) with Buildx and QEMU, **GitHub Actions layer cache**, SBOM and provenance attestations. Pushed to **Amazon ECR** using **GitHub OIDC** (no AWS keys stored in GitHub). Tags: `sha-<7 chars>` and the SemVer version; `latest` is never used and the ECR repository has **immutable tags**.
+3. **Build and push**: multi-arch (`linux/amd64`, `linux/arm64`) with Buildx and QEMU, **GitHub Actions layer cache**, SBOM and provenance attestations. Pushed to **GitHub Container Registry** as `ghcr.io/monwarqx1250/devops-task`, authenticated with the workflow's own `GITHUB_TOKEN` (`packages: write`), so no registry credentials are stored. Tags: `sha-<7 chars>` and the SemVer version; `latest` is never pushed. This job needs no AWS access and runs on every push to `main` and every release tag.
 4. **Deploy** over **SSM Run Command** (no SSH, no open port 22):
    - record the currently deployed tag;
    - run `deploy-app.sh sha-xxxxxxx` on the instance: pull, replace the container, health-check `/health` for up to 60s, and **restore the previous tag automatically** if the new one never becomes healthy;
@@ -314,13 +314,12 @@ Deploys to the same environment never run concurrently and are never cancelled m
 
 ### Required configuration
 
-The pipeline uses no GitHub **secrets**: AWS access is through OIDC. It reads four **variables** from two GitHub Environments, `staging` and `production`, with `production` protected by required reviewers. Their values are Terraform outputs:
+The pipeline uses no GitHub **secrets**: image pushes use the built-in `GITHUB_TOKEN`, and AWS access is through OIDC. The **deploy** job reads three **variables** from two GitHub Environments, `staging` and `production`, with `production` protected by required reviewers. Until they are set, the image is still built and pushed and only the deploy job is skipped. Their values are Terraform outputs:
 
 | Variable | Example | From |
 |---|---|---|
 | `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/devops-task-staging-github-deploy` | `terraform output github_actions_role_arn` |
 | `AWS_REGION` | `us-east-1` | your tfvars |
-| `ECR_REPOSITORY` | `123456789012.dkr.ecr.us-east-1.amazonaws.com/devops-task-staging` | `terraform output ecr_repository_url` |
 | `EC2_INSTANCE_ID` | `i-0abc…` | `terraform output instance_id` |
 
 The OIDC role's trust policy only accepts tokens for `repo:<owner>/<repo>:environment:<env>`, so a workflow on another branch or a fork cannot assume it.
@@ -337,11 +336,10 @@ The OIDC role's trust policy only accepts tokens for `repo:<owner>/<repo>:enviro
 |---|---|
 | EC2 instance | Amazon Linux 2023 (latest AMI via SSM parameter), default VPC, `t3.micro` (staging, Free Tier) / `t3.small` (production), IMDSv2 required with hop limit 1 (containers can't reach instance credentials), encrypted gp3 root volume |
 | Security group | **inbound TCP 80 only** (configurable CIDRs), **outbound TCP 443 only**; no SSH (shell access via SSM Session Manager) |
-| IAM instance profile | ECR pull **for this repository only**, CloudWatch Logs write **to this log group only**, and `AmazonSSMManagedInstanceCore`. No static access keys anywhere. |
-| User data | installs Docker, writes `/etc/devops-task/deploy.env`, installs `scripts/deploy-app.sh` as `/usr/local/bin/deploy-app.sh`, optionally starts an initial image tag |
+| IAM instance profile | CloudWatch Logs write **to this log group only** and `AmazonSSMManagedInstanceCore`. Images come from GHCR, so the role has no registry permissions. No static access keys anywhere. |
+| User data | installs Docker, writes `/etc/devops-task/deploy.env` (image repository `var.image_repository`, log group, environment), installs `scripts/deploy-app.sh` as `/usr/local/bin/deploy-app.sh`, optionally starts an initial image tag |
 | CloudWatch Logs | `/devops-task/<env>/app`, **retention 14 days (staging) / 30 days (production)**; Docker's `awslogs` driver ships container stdout/stderr |
-| ECR | `devops-task-<env>`, immutable tags, scan on push, keeps the last 20 images |
-| GitHub OIDC | identity provider (created once per account) and a deploy role limited to: push to this ECR repository, `ssm:SendCommand` on this instance with `AWS-RunShellScript`, read command results, describe instances |
+| GitHub OIDC | identity provider (created once per account) and a deploy role limited to: `ssm:SendCommand` on this instance with `AWS-RunShellScript`, read command results, describe instances |
 | Remote state | S3 (versioned, encrypted, public access blocked, TLS-only) with **S3-native state locking** (`use_lockfile = true`, Terraform ≥ 1.10, no DynamoDB table needed); separate state key per environment |
 
 ### Usage
@@ -372,7 +370,7 @@ terraform -chdir=terraform apply production.tfplan
 terraform -chdir=terraform destroy -var-file=envs/<env>.tfvars
 ```
 
-Validation: `terraform fmt -check`, `terraform validate` and a Trivy misconfiguration scan pass. Two Trivy findings are accepted and documented inline with `trivy:ignore`: SSE-S3 instead of a customer-managed KMS key on the state bucket, and outbound 443 to `0.0.0.0/0`, which is needed to reach the public ECR/SSM/CloudWatch endpoints without paid VPC endpoints.
+Validation: `terraform fmt -check`, `terraform validate` and a Trivy misconfiguration scan pass. Two Trivy findings are accepted and documented inline with `trivy:ignore`: SSE-S3 instead of a customer-managed KMS key on the state bucket, and outbound 443 to `0.0.0.0/0`, which is needed to reach GHCR and the public SSM/CloudWatch endpoints.
 
 > **Evidence.** *TODO: add the `terraform plan` output and a screenshot/log of a successful `apply` here (resources were destroyed after testing).*
 
@@ -506,7 +504,7 @@ Zero downtime comes from `maxUnavailable: 0` (old pods stay until new ones are r
 | Secrets | Kustomize-generated Secret from a git-ignored file | AWS Secrets Manager or SSM Parameter Store synced by External Secrets Operator (or the Secrets Store CSI driver); KMS envelope encryption of Kubernetes secrets |
 | IAM for pods | none needed | IAM Roles for Service Accounts (IRSA) or EKS Pod Identity, one role per workload, least privilege |
 | Node scaling | fixed nodes | Karpenter (or Cluster Autoscaler) across multiple AZs, with the HPA scaling pods and Karpenter adding nodes |
-| Images | `k3d image import` | ECR with immutable tags, scanned on push, pulled by digest |
+| Images | `k3d image import` | GHCR (or ECR with immutable tags and scan on push), pulled by digest, with an image pull secret or IRSA |
 | Delivery | `kubectl apply -k` | GitOps (Argo CD or Flux) from the repo, with Argo Rollouts for canary releases and automatic rollback on error-rate analysis |
 | Observability | Docker-based stack | kube-prometheus-stack or Amazon Managed Prometheus/Grafana, Alloy/Fluent Bit DaemonSet to Loki or CloudWatch |
 | Network | open in-cluster | NetworkPolicies (VPC CNI network policy support), private subnets for nodes, security groups for pods |
@@ -564,14 +562,14 @@ flowchart LR
   gh --> pr
   gh --> cd
   cd -- OIDC: short-lived creds --> sts[AWS STS]
-  cd -- push sha-xxxx + semver --> ecr[(Amazon ECR<br/>immutable tags)]
+  cd -- GITHUB_TOKEN: push sha-xxxx + semver --> ghcr[(GitHub Container Registry<br/>ghcr.io)]
   cd -- SSM Run Command --> ec2
 
   subgraph aws[AWS · Terraform · S3 state + lockfile]
     ec2[EC2 · Amazon Linux 2023<br/>Docker · deploy-app.sh<br/>SG: in 80 · out 443]
     cw[(CloudWatch Logs<br/>14/30-day retention)]
   end
-  ecr -- pull via instance role --> ec2
+  ghcr -- pull --> ec2
   ec2 -- awslogs driver --> cw
   cd -- smoke test /health,<br/>rollback on failure --> ec2
 
@@ -604,13 +602,15 @@ flowchart LR
 
 **Deploy over SSM, not SSH.** No port 22, no SSH keys to store or rotate, IAM-authorised and logged in CloudTrail, and the same channel gives an interactive shell (Session Manager).
 
-**Tagging strategy.** Every image gets `sha-<commit>`, which is immutable and traceable, and deploys always use it. It also gets a SemVer tag: `X.Y.Z` for releases (git tag `vX.Y.Z`), `X.Y.Z-main.<run>` for main builds. ECR tags are immutable, so a tag can never be overwritten and a rollback always gets exactly the same image. `latest` is never pushed.
+**Tagging strategy.** Every image gets `sha-<commit>`, which is unique per commit and traceable, and deploys always use it. It also gets a SemVer tag: `X.Y.Z` for releases (git tag `vX.Y.Z`), `X.Y.Z-main.<run>` for main builds. Nothing overwrites an existing tag, because every build produces new ones, so a rollback always gets the same image. `latest` is never pushed.
 
-**Secrets strategy.** CI to AWS uses **GitHub OIDC**: no long-lived keys, the role is scoped to one repository and environment, credentials expire within an hour. The instance uses its **instance profile**. Grafana's admin password comes from a git-ignored `.env` (Compose refuses to start without it). Kubernetes secrets come from a git-ignored file through Kustomize's `secretGenerator`; in production they would come from AWS Secrets Manager via External Secrets.
+**GitHub Container Registry instead of ECR.** The registry lives next to the code: CI pushes with the workflow's own token, so no registry credentials or AWS permissions are needed to build and publish. The image is public like the repository, so the EC2 instance pulls it without credentials and the instance role needs no registry permissions. The trade-offs are that GHCR tags are not enforced as immutable (ECR can enforce this) and there is no built-in scan on push; Trivy in CI covers scanning.
+
+**Secrets strategy.** Image pushes use the workflow's short-lived `GITHUB_TOKEN`. CI to AWS uses **GitHub OIDC**: no long-lived keys, the role is scoped to one repository and environment, credentials expire within an hour. The instance uses its **instance profile**. Grafana's admin password comes from a git-ignored `.env` (Compose refuses to start without it). Kubernetes secrets come from a git-ignored file through Kustomize's `secretGenerator`; in production they would come from AWS Secrets Manager via External Secrets.
 
 **State locking.** S3-native locking (`use_lockfile`, Terraform ≥ 1.10) replaces the DynamoDB lock table: one less resource, same protection.
 
-**Per-environment everything.** Staging and production share the Terraform code but have separate state, ECR repositories, roles and log groups, so a staging mistake cannot touch production. The trade-off is that a release is rebuilt for production from the same commit and lockfile instead of copying the staging image digest (see improvements).
+**Per-environment everything.** Staging and production share the Terraform code but have separate state, instances, roles and log groups, so a staging mistake cannot touch production. Both environments pull from the same image repository; a release tag rebuilds from the same commit and lockfile instead of promoting the exact staging digest (see improvements).
 
 **Log labels.** Only bounded values (`container`, `service`, `project`, `level`) are Loki labels; per-request fields are structured metadata. See [Log labels and cardinality](#log-labels-and-cardinality).
 
@@ -637,7 +637,7 @@ flowchart LR
 |---|---|
 | New version fails its health check during deploy | automatic, on the instance (`deploy-app.sh`) |
 | New version fails the external smoke test | automatic, by the CD workflow |
-| A problem found later (errors, latency) | `aws ssm send-command … /usr/local/bin/deploy-app.sh --rollback` (swaps to the previous tag), or deploy any older tag: `deploy-app.sh sha-<old>`. ECR keeps the last 20 immutable images. |
+| A problem found later (errors, latency) | `aws ssm send-command … /usr/local/bin/deploy-app.sh --rollback` (swaps to the previous tag), or deploy any older tag: `deploy-app.sh sha-<old>`. Every built `sha-` tag stays in GHCR. |
 | Kubernetes | `kubectl -n devops-task rollout undo deployment/app` (or `--to-revision=N`) |
 | Code-level fix forward | revert the commit on `main`; the pipeline ships it like any other change |
 
@@ -655,16 +655,17 @@ Single-instance EC2 deploys have a few seconds of downtime while the container i
 
 **Image scanning and supply chain.**
 - Trivy fails CI on CRITICAL vulnerabilities that have a fix, and reports HIGH for information.
-- ECR scans every pushed image.
+- Images are published only after CI's Trivy gate passes.
 - Base images and every monitoring image are pinned; the app base image is pinned by digest.
 - Production dependencies install from the lockfile.
 - CD attaches SBOM and provenance attestations.
 - Trivy also scans the Dockerfile, Terraform and Kubernetes manifests for misconfigurations.
 
 **IAM (least privilege).**
-- The instance role can pull from one ECR repository, write to one log group and register with SSM.
-- The deploy role can push to one repository, send `AWS-RunShellScript` to one instance and read results.
-- Wildcard resources are only used where AWS does not support resource-level permissions (`ecr:GetAuthorizationToken`, `ec2:DescribeInstances`, `ssm:GetCommandInvocation`), and are commented as such.
+- The instance role can write to one log group and register with SSM; it has no registry permissions.
+- The deploy role can send `AWS-RunShellScript` to one instance and read the results.
+- The CD build job gets `packages: write` only for its own run; other jobs have read-only tokens.
+- Wildcard resources are only used where AWS does not support resource-level permissions (`ec2:DescribeInstances`, `ssm:GetCommandInvocation`), and are commented as such.
 
 **Network exposure.**
 - **EC2:** inbound only TCP 80 from configurable CIDRs, outbound only TCP 443, no SSH.
@@ -696,12 +697,12 @@ Rough on-demand prices for **us-east-1**, based on typical AWS list prices. Pric
 | EBS gp3 10 GB | ~$0.80 | ~$0.80 |
 | Public IPv4 address | ~$3.65 | ~$3.65 |
 | CloudWatch Logs (~1 GB ingested + stored) | ~$0.55 | ~$0.55 |
-| ECR storage (~2 GB of images) | ~$0.20 | ~$0.20 |
+| Image registry (GHCR, public package) | $0 | $0 |
 | Data transfer out (~10 GB) | ~$0.90 | ~$0.90 |
 | S3 state + SSM | < $0.10 | < $0.10 |
 | **Total** | **~$14 / month** | **~$21 / month** |
 
-**What a production-grade setup would cost:** 2 × `t3.small` across two AZs (~$30), an Application Load Balancer (~$18 + LCUs), 2 public IPv4 addresses (~$7), more logs and metrics (~$10), and VPC endpoints for ECR/SSM/CloudWatch instead of open egress (~$30 for 4 interface endpoints in one AZ). That's roughly **$95–110 per month**. Running the same service on ECS Fargate (2 × 0.25 vCPU / 0.5 GB tasks, ~$18) plus an ALB comes to a similar range with no hosts to patch. EKS adds ~$73/month for the control plane alone.
+**What a production-grade setup would cost:** 2 × `t3.small` across two AZs (~$30), an Application Load Balancer (~$18 + LCUs), 2 public IPv4 addresses (~$7), more logs and metrics (~$10), and VPC endpoints for SSM and CloudWatch Logs instead of open egress (~$22 for 3 interface endpoints in one AZ). That's roughly **$95–110 per month**. Running the same service on ECS Fargate (2 × 0.25 vCPU / 0.5 GB tasks, ~$18) plus an ALB comes to a similar range with no hosts to patch. EKS adds ~$73/month for the control plane alone.
 
 ---
 
@@ -709,7 +710,7 @@ Rough on-demand prices for **us-east-1**, based on typical AWS list prices. Pric
 
 - **Zero-downtime EC2 deploys:** two instances in an Auto Scaling group behind an ALB with rolling or blue/green deploys, or move to ECS Fargate.
 - **Promote, don't rebuild:** copy the exact staging image digest to production instead of rebuilding from the tag, and sign images with Cosign and verify signatures before deploy.
-- **TLS** on the public endpoint (ALB + ACM), and **VPC endpoints** so instance egress can be closed to the internet.
+- **TLS** on the public endpoint (ALB + ACM), and **VPC endpoints** for SSM and CloudWatch, so instance egress can be narrowed to the image registry (or closed entirely by mirroring images into ECR through a pull-through cache).
 - **Alertmanager** with routing to Slack/Discord (severity-based routes, inhibition of `AppHighErrorRate` while `AppInstanceDown` fires), and an alert runbook per rule.
 - **Pin GitHub Actions to commit SHAs** with Dependabot/Renovate keeping them, the base images and dependencies up to date.
 - **Distributed tracing** with OpenTelemetry and Grafana Tempo, linked from logs via `req_id`/trace IDs.

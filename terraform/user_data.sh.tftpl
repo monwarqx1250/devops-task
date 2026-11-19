@@ -10,7 +10,7 @@ systemctl enable --now docker
 install -d -m 0755 /etc/devops-task /var/lib/devops-task
 cat > /etc/devops-task/deploy.env <<'CONF'
 AWS_REGION=${aws_region}
-ECR_REPOSITORY_URL=${ecr_repository_url}
+IMAGE_REPOSITORY=${image_repository}
 LOG_GROUP=${log_group}
 APP_ENVIRONMENT=${environment}
 LOG_LEVEL=${log_level}

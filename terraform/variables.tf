@@ -72,8 +72,8 @@ variable "create_github_oidc_provider" {
   default     = true
 }
 
-variable "ecr_image_retention_count" {
-  description = "Number of most recent images kept in ECR."
-  type        = number
-  default     = 20
+variable "image_repository" {
+  description = "Container image repository the instance pulls from (GitHub Container Registry)."
+  type        = string
+  default     = "ghcr.io/monwarqx1250/devops-task"
 }

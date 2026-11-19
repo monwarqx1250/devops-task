@@ -15,10 +15,10 @@ resource "aws_vpc_security_group_ingress_rule" "http" {
   cidr_ipv4         = each.value
 }
 
-# Outbound HTTPS covers ECR, CloudWatch Logs, SSM and the dnf package mirrors.
+# Outbound HTTPS covers GHCR, CloudWatch Logs, SSM and the dnf package mirrors.
 # DNS and NTP use the VPC resolver / Amazon Time Sync, which security groups don't filter.
-# Accepted: ECR/SSM/CloudWatch are public endpoints, so restricting egress further needs
-# VPC interface endpoints (~$7/month each). Listed under "What I would improve".
+# Accepted: GHCR, SSM and CloudWatch are public endpoints, so restricting egress further
+# needs VPC interface endpoints and an egress proxy. Listed under "What I would improve".
 #trivy:ignore:AVD-AWS-0104
 resource "aws_vpc_security_group_egress_rule" "https" {
   security_group_id = aws_security_group.app.id
@@ -37,13 +37,13 @@ resource "aws_instance" "app" {
   iam_instance_profile   = aws_iam_instance_profile.instance.name
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    aws_region         = var.aws_region
-    ecr_repository_url = aws_ecr_repository.app.repository_url
-    log_group          = aws_cloudwatch_log_group.app.name
-    environment        = var.environment
-    log_level          = var.log_level
-    image_tag          = var.image_tag
-    deploy_script      = file("${path.module}/../scripts/deploy-app.sh")
+    aws_region       = var.aws_region
+    image_repository = var.image_repository
+    log_group        = aws_cloudwatch_log_group.app.name
+    environment      = var.environment
+    log_level        = var.log_level
+    image_tag        = var.image_tag
+    deploy_script    = file("${path.module}/../scripts/deploy-app.sh")
   })
   user_data_replace_on_change = true
 

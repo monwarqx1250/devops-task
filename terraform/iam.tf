@@ -1,6 +1,7 @@
 # ---------------------------------------------------------------------------
-# EC2 instance role: pull from this ECR repository, write to this log group,
-# and register with SSM (for CI deploys and shell access without SSH).
+# EC2 instance role: write to this log group and register with SSM (for CI
+# deploys and shell access without SSH). Images come from GHCR, so no registry
+# permissions are needed in AWS.
 # No static access keys anywhere: credentials come from the instance profile.
 # ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "ec2_assume" {
@@ -19,22 +20,6 @@ resource "aws_iam_role" "instance" {
 }
 
 data "aws_iam_policy_document" "instance" {
-  statement {
-    sid       = "EcrAuth"
-    actions   = ["ecr:GetAuthorizationToken"] # does not support resource-level permissions
-    resources = ["*"]
-  }
-
-  statement {
-    sid = "EcrPullThisRepo"
-    actions = [
-      "ecr:BatchCheckLayerAvailability",
-      "ecr:BatchGetImage",
-      "ecr:GetDownloadUrlForLayer",
-    ]
-    resources = [aws_ecr_repository.app.arn]
-  }
-
   statement {
     sid       = "WriteAppLogs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
