@@ -1,0 +1,29 @@
+#!/bin/bash
+# EC2 bootstrap (Amazon Linux 2023): install Docker, install the deploy script,
+# and start the app if an initial image tag was given.
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+
+dnf install -y docker
+systemctl enable --now docker
+
+install -d -m 0755 /etc/devops-task /var/lib/devops-task
+cat > /etc/devops-task/deploy.env <<'CONF'
+AWS_REGION=${aws_region}
+ECR_REPOSITORY_URL=${ecr_repository_url}
+LOG_GROUP=${log_group}
+APP_ENVIRONMENT=${environment}
+LOG_LEVEL=${log_level}
+HOST_PORT=80
+CONF
+
+cat > /usr/local/bin/deploy-app.sh <<'SCRIPT'
+${deploy_script}
+SCRIPT
+chmod 0755 /usr/local/bin/deploy-app.sh
+
+%{ if image_tag != "" ~}
+/usr/local/bin/deploy-app.sh "${image_tag}" || echo "initial deploy of ${image_tag} failed; CI will deploy on the next push"
+%{ else ~}
+echo "No initial image_tag set; waiting for the first CI deploy."
+%{ endif ~}
