@@ -1,0 +1,30 @@
+# Dependencies and build output
+node_modules/
+coverage/
+dist/
+
+# Local secrets (copy .env.example to .env)
+.env
+.env.*
+!.env.example
+
+# Runtime output of scripts/system_health.sh
+health_log.txt*
+
+# Terraform local state and caches
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Assessment brief (not part of the deliverable)
+DevOps_Engineer_Assessment_Task.pdf
+
+# Kubernetes secret values
+k8s/secret.env

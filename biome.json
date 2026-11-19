@@ -1,0 +1,11 @@
+{
+  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "files": {
+    "include": ["server.ts", "src/**/*.ts", "test/**/*.ts", "k6.js"]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": { "recommended": true }
+  },
+  "formatter": { "enabled": false }
+}
