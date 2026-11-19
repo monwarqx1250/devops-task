@@ -1,0 +1,22 @@
+[Unit]
+Description=Collect host health metrics (system_health.sh)
+Documentation=https://github.com/monwarqx1250/devops-task#linux-automation-system_healthsh
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Exit 1 (warning) and 2 (critical) are expected results, not unit failures.
+SuccessExitStatus=1 2
+ExecStart=/usr/local/bin/system_health.sh --quiet --json --log-file /var/log/system_health/health_log.txt
+# Optional webhook for warning/critical results:
+# EnvironmentFile=-/etc/default/system-health   (HEALTH_WEBHOOK_URL=https://hooks.slack.com/...)
+EnvironmentFile=-/etc/default/system-health
+Nice=10
+IOSchedulingClass=idle
+# Hardening: the script only reads /proc and writes its own log directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+LogsDirectory=system_health
+ReadWritePaths=/var/log/system_health
